@@ -262,13 +262,13 @@ def read_observability(path):
 
 def read_boundaries(path):
     """Read boundaries as (n, 2) ndarray, sorted by start position."""
-    data = np.loadtxt(path, dtype=np.float64)
+    data = np.loadtxt(path, dtype=np.float64, ndim=2)
     return data[np.argsort(data[:, 0])]
 
 
 def read_gamma_shape(path):
     """Read gamma shape params; return sorted (freq_arr, shape_arr)."""
-    data = np.loadtxt(path, dtype=np.float64)
+    data = np.loadtxt(path, dtype=np.float64, ndim=2)
     order = np.argsort(data[:, 0])
     return data[order, 0], data[order, 1]
 
