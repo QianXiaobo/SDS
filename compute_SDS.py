@@ -159,9 +159,10 @@ def _optimize_single_init(init_pt, dat0, dat1, dat2, A1, A2):
 # Singleton distance computation (vectorized per individual)
 # ─────────────────────────────────────────────────────────────────
 
-def _compute_distances(singletons, singletons_current_idx, test_loc, bound_up, bound_down):
+def _compute_distances(singletons, singletons_current_idx, test_loc,
+                       bound_up, bound_down, valid_mask=None):
     """
-    Compute upstream and downstream singleton distances for all individuals.
+    Compute upstream and downstream singleton distances.
 
     Parameters
     ----------
@@ -170,19 +171,31 @@ def _compute_distances(singletons, singletons_current_idx, test_loc, bound_up, b
         Per-individual cursor indices (in-place modified).
     test_loc : float
     bound_up, bound_down : float
+    valid_mask : ndarray, shape (n_individuals,), optional
+        Boolean mask. If provided, only individuals where mask is True
+        have their indices advanced and distances computed. Missing-genotype
+        individuals are skipped entirely.
 
     Returns
     -------
     upstream, downstream : ndarray, shape (n_individuals,)
+        Distances for all individuals (NaN for excluded/missing ones).
     """
     n_ind = singletons.shape[0]
     max_col = singletons.shape[1]
 
-    upstream = np.full(n_ind, np.nan, dtype=np.float64)
+    upstream   = np.full(n_ind, np.nan, dtype=np.float64)
     downstream = np.full(n_ind, np.nan, dtype=np.float64)
 
-    # Advance each individual's cursor past singletons before test_loc
-    for i in range(n_ind):
+    # If no mask provided, all individuals are valid
+    if valid_mask is None:
+        valid_mask = np.ones(n_ind, dtype=bool)
+
+    # Advance cursor and compute distances for VALID individuals only.
+    # This ensures missing-genotype individuals do NOT consume their
+    # singleton lookahead slots, keeping indices consistent.
+    valid_inds = np.where(valid_mask)[0]
+    for i in valid_inds:
         ci = singletons_current_idx[i]
         while ci < max_col:
             val = singletons[i, ci]
@@ -191,7 +204,23 @@ def _compute_distances(singletons, singletons_current_idx, test_loc, bound_up, b
             ci += 1
         singletons_current_idx[i] = ci
 
-    # Compute upstream (nearest singleton before test_loc)
+    # Upstream: nearest singleton before test_loc
+    for i in valid_inds:
+        si = singletons_current_idx[i] - 1
+        if si >= 0:
+            s_loc = singletons[i, si]
+            if not np.isnan(s_loc) and s_loc >= bound_up:
+                upstream[i] = test_loc - s_loc
+
+    # Downstream: nearest singleton at or after test_loc
+    for i in valid_inds:
+        ci = singletons_current_idx[i]
+        if ci < max_col:
+            s_loc = singletons[i, ci]
+            if not np.isnan(s_loc) and bound_up <= s_loc <= bound_down:
+                downstream[i] = s_loc - test_loc
+
+    return upstream, downstream
     for i in range(n_ind):
         si = singletons_current_idx[i] - 1
         if si >= 0:
@@ -262,13 +291,13 @@ def read_observability(path):
 
 def read_boundaries(path):
     """Read boundaries as (n, 2) ndarray, sorted by start position."""
-    data = np.loadtxt(path, dtype=np.float64, ndmin=2)
+    data = np.loadtxt(path, dtype=np.float64)
     return data[np.argsort(data[:, 0])]
 
 
 def read_gamma_shape(path):
     """Read gamma shape params; return sorted (freq_arr, shape_arr)."""
-    data = np.loadtxt(path, dtype=np.float64, ndmin=2)
+    data = np.loadtxt(path, dtype=np.float64)
     order = np.argsort(data[:, 0])
     return data[order, 0], data[order, 1]
 
@@ -366,9 +395,21 @@ def main():
             allele1  = tokens[1]   # ancestral
             allele2  = tokens[2]   # derived
             test_loc = float(tokens[3])
-            genotypes = np.array(tokens[4:], dtype=np.float64)
 
-            # Advance to the correct boundary region
+            # ── Parse genotypes, treating "." as missing (NaN) ──
+            raw_genotypes = np.array([
+                np.nan if t in ('.', 'NA', 'nan', '') else float(t)
+                for t in tokens[4:]
+            ], dtype=np.float64)
+
+            # Skip this SNP if all genotypes are missing
+            valid_mask = ~np.isnan(raw_genotypes)
+            if not np.any(valid_mask):
+                continue
+
+            genotypes = raw_genotypes[valid_mask]   # only valid individuals
+
+            # ── Advance to the correct boundary region ──
             while (boundaries_cur < len(boundaries)
                    and boundaries[boundaries_cur, 1] < test_loc):
                 boundaries_cur += 1
@@ -382,19 +423,25 @@ def main():
             bound_up = boundaries[boundaries_cur, 0]
             bound_down = boundaries[boundaries_cur, 1]
 
-            # ── Singleton distances (NumPy vectorized) ──
-            upstream, downstream = _compute_distances(
-                singletons, singletons_current_idx, test_loc, bound_up, bound_down)
+            # ── Singleton distances for VALID individuals only ──
+            upstream_all, downstream_all = _compute_distances(
+                singletons, singletons_current_idx, test_loc,
+                bound_up, bound_down, valid_mask=valid_mask)
 
+            # Keep only valid individuals
+            upstream   = upstream_all[valid_mask]
+            downstream = downstream_all[valid_mask]
+
+            # Skip if too many missing singleton distances within valid individuals
             if (np.mean(np.isnan(upstream)) > SKIP_BOUNDARY_FRACTION
                     or np.mean(np.isnan(downstream)) > SKIP_BOUNDARY_FRACTION):
                 continue
 
-            upstream[np.isnan(upstream)] = np.nanmax(upstream)
+            upstream[np.isnan(upstream)]  = np.nanmax(upstream)
             downstream[np.isnan(downstream)] = np.nanmax(downstream)
-            intervals = (upstream + downstream) * sin_obs
+            intervals = (upstream + downstream) * sin_obs[valid_mask]
 
-            # ── Genotype groups ──
+            # ── Genotype groups (no missing values here) ──
             daf = float(np.mean(genotypes)) / 2.0
             dat0 = intervals[genotypes == 0]
             dat1 = intervals[genotypes == 1]
