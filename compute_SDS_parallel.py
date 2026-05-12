@@ -533,10 +533,12 @@ def main():
 
         logE1, logE2 = best_params
         rSDS = logE1 - logE2
-        suggested = f"1e{np.mean(best_params) / np.log(10.0):.1f}"
+        suggested_exp = round(np.mean(best_params) / np.log(10.0))
+        suggested = f"1e{int(suggested_exp)}"
+        pos_str = (f"{info['location']:.0f}" if info['location'] < 1e6
+                   else f"{info['location']:.4g}")
 
-        print(f"{info['id']}\t{info['allele1']}\t{info['allele2']}\t"
-              f"{int(info['location'])}\t"
+        print(f"{info['id']}\t{info['allele1']}\t{info['allele2']}\t{pos_str}\t"
               f"{info['daf']:.{PRECISION}f}\t"
               f"{info['n0']}\t{info['n1']}\t{info['n2']}\t"
               f"{rSDS:.{PRECISION}f}\t{suggested}")
