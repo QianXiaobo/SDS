@@ -71,7 +71,6 @@ E_GRID_SCALE_FACTOR = 20
 OPTIM_NUM_ITERATIONS = 5
 SKIP_BOUNDARY_FRACTION = 0.05
 
-
 # ─────────────────────────────────────────────────────────────────
 # Core numeric functions (must be at module level for pickling)
 # ─────────────────────────────────────────────────────────────────
@@ -346,13 +345,16 @@ def read_test_snps(path):
             tokens = line.split()
             if len(tokens) < 5:
                 continue
+            genotypes = np.array([
+                np.nan if t in ('.', 'NA', 'nan', '') else float(t)
+                for t in tokens[4:]
+            ], dtype=np.float64)
             snps.append({
                 'id': tokens[0],
                 'allele1': tokens[1],
                 'allele2': tokens[2],
                 'location': float(tokens[3]),
-                'genotypes': np.array([float(t) for t in tokens[4:]],
-                                      dtype=np.float64)
+                'genotypes': genotypes
             })
     return snps
 
