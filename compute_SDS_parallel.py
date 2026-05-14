@@ -482,6 +482,9 @@ def main():
     parser.add_argument('b_file',  help='Chromosome boundaries file')
     parser.add_argument('g_file',  help='Gamma shape parameters file')
     parser.add_argument('init', type=float, help='Initial MLE guess (e.g. 1e-6)')
+    parser.add_argument('--output', '-o', type=str, default=None,
+                        help='Output file for SDS results (default: stdout). '
+                             'Use "-" for stdout explicitly.')
     parser.add_argument('--max-singletons', type=int, default=10000,
                         help='Max singletons per individual (default: 10000)')
     parser.add_argument('--workers', '-w', type=int, default=None,
@@ -495,13 +498,18 @@ def main():
 
     n_workers = args.workers or max(1, cpu_count() - 1)
 
+    # ── Open output file ──
+    if args.output and args.output != '-':
+        out_fh = open(args.output, 'w')
+    else:
+        out_fh = sys.stdout
+
     # ── Load reference data (small, constant memory) ──
-    print(f"# Loading singletons from {args.s_file}...", file=sys.stderr)
+    print(f"# Loading singletons from {args.s_file}...")
     singletons_list = read_singletons(args.s_file, args.max_singletons)
     n_ind = len(singletons_list)
     print(f"#   {n_ind} individuals, "
-          f"avg {np.mean([len(s) for s in singletons_list]):.0f} singletons/ind",
-          file=sys.stderr)
+          f"avg {np.mean([len(s) for s in singletons_list]):.0f} singletons/ind")
 
     sin_obs = read_observability(args.o_file)
     if sin_obs is None:
@@ -514,9 +522,9 @@ def main():
 
     print(f"# Loaded: {n_ind} individuals, "
           f"{len(boundaries)} boundary regions, "
-          f"{len(gamma_freq)} gamma points", file=sys.stderr)
+          f"{len(gamma_freq)} gamma points")
     print(f"# Chunk size: {args.chunk_size} SNPs, "
-          f"{n_workers} parallel workers", file=sys.stderr)
+          f"{n_workers} parallel workers")
 
     # ── Precompute log-E grid (same for all SNPs) ──
     e_grid_center = args.init
@@ -528,79 +536,83 @@ def main():
     logE_center = np.log(e_grid_center)
 
     # ── Header ──
-    print("ID\tAA\tDA\tPOS\tDAF\tnG0\tnG1\tnG2\trSDS\tSuggestedInitPoint")
+    print("ID\tAA\tDA\tPOS\tDAF\tnG0\tnG1\tnG2\trSDS\tSuggestedInitPoint",
+          file=out_fh)
 
     # ── Process SNPs in chunks ──
     boundaries_cur = 0
     total_processed = 0
     total_valid = 0
 
-    with ProcessPoolExecutor(max_workers=n_workers) as executor:
-        for chunk_idx, chunk in enumerate(
-                iter_test_snp_chunks(args.t_file, args.chunk_size)):
+    try:
+        with ProcessPoolExecutor(max_workers=n_workers) as executor:
+            for chunk_idx, chunk in enumerate(
+                    iter_test_snp_chunks(args.t_file, args.chunk_size)):
 
-            if args.debug:
-                print(f"# Chunk {chunk_idx + 1}: {len(chunk)} SNPs, "
-                      f"computing intervals...", file=sys.stderr)
+                if args.debug:
+                    print(f"# Chunk {chunk_idx + 1}: {len(chunk)} SNPs, "
+                          f"computing intervals...")
 
-            mle_tasks, task_info, boundaries_cur = _process_snp_chunk(
-                chunk, singletons_list, sin_obs, boundaries,
-                boundaries_cur, gamma_freq, gamma_shape,
-                logE_grid, logE_center, n_ind)
+                mle_tasks, task_info, boundaries_cur = _process_snp_chunk(
+                    chunk, singletons_list, sin_obs, boundaries,
+                    boundaries_cur, gamma_freq, gamma_shape,
+                    logE_grid, logE_center, n_ind)
 
-            if not mle_tasks:
-                total_processed += len(chunk)
-                continue
-
-            if args.debug:
-                print(f"#   {len(mle_tasks)} valid SNPs, "
-                      f"submitting MLE jobs...", file=sys.stderr)
-
-            # Submit all MLE tasks for this chunk
-            future_to_idx = {
-                executor.submit(_run_mle_for_snp, task): i
-                for i, task in enumerate(mle_tasks)
-            }
-
-            results = [None] * len(mle_tasks)
-            chunk_completed = 0
-
-            for future in as_completed(future_to_idx):
-                idx = future_to_idx[future]
-                results[idx] = future.result()
-                chunk_completed += 1
-                if args.debug and chunk_completed % 1000 == 0:
-                    print(f"#   MLE {chunk_completed}/{len(mle_tasks)}",
-                          file=sys.stderr)
-
-            # Output results for this chunk (preserves input order)
-            for idx, info in enumerate(task_info):
-                best_params = results[idx]
-                if best_params is None:
+                if not mle_tasks:
+                    total_processed += len(chunk)
                     continue
 
-                logE1, logE2 = best_params
-                rSDS = logE1 - logE2
-                suggested_exp = round(np.mean(best_params) / np.log(10.0))
-                suggested = f"1e{int(suggested_exp)}"
-                pos_str = (f"{info['location']:.0f}" if info['location'] < 1e6
-                           else f"{info['location']:.4g}")
+                if args.debug:
+                    print(f"#   {len(mle_tasks)} valid SNPs, "
+                          f"submitting MLE jobs...")
 
-                print(f"{info['id']}\t{info['allele1']}\t{info['allele2']}\t"
-                      f"{pos_str}\t"
-                      f"{info['daf']:.{PRECISION}f}\t"
-                      f"{info['n0']}\t{info['n1']}\t{info['n2']}\t"
-                      f"{rSDS:.{PRECISION}f}\t{suggested}")
+                # Submit all MLE tasks for this chunk
+                future_to_idx = {
+                    executor.submit(_run_mle_for_snp, task): i
+                    for i, task in enumerate(mle_tasks)
+                }
 
-            total_processed += len(chunk)
-            total_valid += len(task_info)
+                results = [None] * len(mle_tasks)
+                chunk_completed = 0
 
-            if args.debug:
-                print(f"#   Chunk done. Total: {total_valid} valid / "
-                      f"{total_processed} processed SNPs", file=sys.stderr)
+                for future in as_completed(future_to_idx):
+                    idx = future_to_idx[future]
+                    results[idx] = future.result()
+                    chunk_completed += 1
+                    if args.debug and chunk_completed % 1000 == 0:
+                        print(f"#   MLE {chunk_completed}/{len(mle_tasks)}")
 
-    print(f"# Done. {total_valid} / {total_processed} SNPs processed.",
-          file=sys.stderr)
+                # Output results for this chunk (preserves input order)
+                for idx, info in enumerate(task_info):
+                    best_params = results[idx]
+                    if best_params is None:
+                        continue
+
+                    logE1, logE2 = best_params
+                    rSDS = logE1 - logE2
+                    suggested_exp = round(np.mean(best_params) / np.log(10.0))
+                    suggested = f"1e{int(suggested_exp)}"
+                    pos_str = (f"{info['location']:.0f}" if info['location'] < 1e6
+                               else f"{info['location']:.4g}")
+
+                    print(f"{info['id']}\t{info['allele1']}\t{info['allele2']}\t"
+                          f"{pos_str}\t"
+                          f"{info['daf']:.{PRECISION}f}\t"
+                          f"{info['n0']}\t{info['n1']}\t{info['n2']}\t"
+                          f"{rSDS:.{PRECISION}f}\t{suggested}",
+                          file=out_fh)
+
+                total_processed += len(chunk)
+                total_valid += len(task_info)
+
+                if args.debug:
+                    print(f"#   Chunk done. Total: {total_valid} valid / "
+                          f"{total_processed} processed SNPs")
+
+        print(f"# Done. {total_valid} / {total_processed} SNPs processed.")
+    finally:
+        if out_fh is not sys.stdout:
+            out_fh.close()
 
 
 if __name__ == '__main__':
