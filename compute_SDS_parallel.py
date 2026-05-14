@@ -2,19 +2,23 @@
 """
 compute_SDS_parallel.py — Singleton Density Score (SDS) computation
 
-Python rewrite of compute_SDS.R with true multi-process parallelism.
+Python rewrite of compute_SDS.R with true multi-process parallelism and
+chunked streaming for large datasets.
 
-Key optimizations over the R original and the existing compute_SDS.py:
+Key optimizations over the R original:
   1. np.searchsorted replaces the sequential linear scan over singletons,
      making each test-SNP's interval computation fully independent — O(log n)
      per lookup instead of O(n) linear scan.
   2. Because each SNP is now independent, the expensive MLE optimization can
      be parallelized across SNPs using ProcessPoolExecutor (true multi-process,
      bypassing the GIL), rather than just parallelizing starting points within
-     a single SNP (ThreadPoolExecutor, which is GIL-limited for CPU work).
+     a single SNP.
   3. Singletons are stored as a list of sorted np arrays (one per individual)
      instead of a padded NaN matrix — less memory, and searchsorted is O(log n).
-  4. Batch precomputation of all SNP intervals before MLE.
+  4. Chunked streaming: test SNPs are read and processed in configurable chunks,
+     keeping memory bounded. This is critical for genome-scale data
+     (e.g. 3M SNPs × 12K individuals comfortably fits in 16 GB RAM).
+  5. Genotypes stored as int8 (8× memory reduction vs float64).
 
 Dependencies:
     pip install numpy scipy
@@ -23,12 +27,16 @@ Usage:
     python compute_SDS_parallel.py s_file t_file o_file b_file g_file init [options]
 
 Examples:
-    # Sequential (single process)
+    # Sequential (single worker)
     python compute_SDS_parallel.py example.singletons example.testsnp \\
         example.observability example.boundaries example.gamma_shapes 1e-6
 
-    # Parallel with 8 processes
+    # Parallel with 8 workers
     python compute_SDS_parallel.py s.txt t.txt o.txt b.txt g.txt 1e-6 --workers 8
+
+    # Tune chunk size for memory/performance trade-off
+    python compute_SDS_parallel.py s.txt t.txt o.txt b.txt g.txt 1e-6 \\
+        --chunk-size 3000 --workers 8
 
     # Debug mode (progress every 1000 SNPs)
     python compute_SDS_parallel.py s.txt t.txt o.txt b.txt g.txt 1e-6 --debug
@@ -59,7 +67,6 @@ import numpy as np
 from scipy.optimize import minimize
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import cpu_count
-from functools import partial
 
 # ─────────────────────────────────────────────────────────────────
 # Global constants
@@ -70,6 +77,8 @@ E_GRID_NUM_POINTS = 50
 E_GRID_SCALE_FACTOR = 20
 OPTIM_NUM_ITERATIONS = 5
 SKIP_BOUNDARY_FRACTION = 0.05
+GENOTYPE_MISSING = -1          # sentinel for missing genotype in int8 arrays
+
 
 # ─────────────────────────────────────────────────────────────────
 # Core numeric functions (must be at module level for pickling)
@@ -159,14 +168,14 @@ def _run_mle_for_snp(snp_task):
     Parameters
     ----------
     snp_task : tuple
-        (dat0, dat1, dat2, A1, A2, logE_grid, logE_center, n_workers)
+        (dat0, dat1, dat2, A1, A2, logE_grid, logE_center)
 
     Returns
     -------
     tuple
         (best_logE1, best_logE2) or None if optimization fails.
     """
-    dat0, dat1, dat2, A1, A2, logE_grid, logE_center, n_workers = snp_task
+    dat0, dat1, dat2, A1, A2, logE_grid, logE_center = snp_task
 
     # Build starting points: random from grid + center
     rng = np.random.default_rng()
@@ -180,7 +189,6 @@ def _run_mle_for_snp(snp_task):
     best_params = None
     best_ll = -np.inf
 
-    # Run each start sequentially within this process (avoid nested parallelism)
     for args in init_pts:
         params, ll = _optimize_one_start(args)
         if ll > best_ll:
@@ -195,7 +203,7 @@ def _run_mle_for_snp(snp_task):
 # ─────────────────────────────────────────────────────────────────
 
 def _compute_snp_intervals(test_loc, bound_up, bound_down,
-                           singletons_list, sin_observability, genotypes):
+                           singletons_list, sin_observability):
     """
     Compute singleton intervals for one test-SNP using binary search.
 
@@ -213,8 +221,6 @@ def _compute_snp_intervals(test_loc, bound_up, bound_down,
         One sorted array per individual.
     sin_observability : ndarray
         Observability correction per individual.
-    genotypes : ndarray
-        Genotypes for valid individuals.
 
     Returns
     -------
@@ -329,14 +335,17 @@ def read_gamma_shape(path):
     return data[order, 0], data[order, 1]
 
 
-def read_test_snps(path):
+def iter_test_snp_chunks(path, chunk_size):
     """
-    Read all test SNPs into memory.
+    Generator that yields chunks of test SNPs.
 
-    Returns list of dicts with keys:
-        id, allele1, allele2, location, genotypes (ndarray)
+    Each chunk is a list of dicts with keys:
+        id, allele1, allele2, location, genotypes (int8 ndarray, -1 = missing)
+
+    This streams through the file without loading all SNPs into memory,
+    which is essential for genome-scale datasets (e.g. 3M SNPs × 12K ind).
     """
-    snps = []
+    chunk = []
     with open(path, 'r') as fh:
         for line in fh:
             line = line.strip()
@@ -345,96 +354,59 @@ def read_test_snps(path):
             tokens = line.split()
             if len(tokens) < 5:
                 continue
-            genotypes = np.array([
-                np.nan if t in ('.', 'NA', 'nan', '') else float(t)
-                for t in tokens[4:]
-            ], dtype=np.float64)
-            snps.append({
+
+            # Parse genotypes as int8; -1 denotes missing
+            n_geno = len(tokens) - 4
+            genotypes = np.full(n_geno, GENOTYPE_MISSING, dtype=np.int8)
+            for j, t in enumerate(tokens[4:]):
+                if t not in ('.', 'NA', 'nan', ''):
+                    try:
+                        genotypes[j] = int(t)
+                    except ValueError:
+                        pass  # keep GENOTYPE_MISSING
+
+            chunk.append({
                 'id': tokens[0],
                 'allele1': tokens[1],
                 'allele2': tokens[2],
                 'location': float(tokens[3]),
-                'genotypes': genotypes
+                'genotypes': genotypes,
             })
-    return snps
+
+            if len(chunk) >= chunk_size:
+                yield chunk
+                chunk = []
+
+    if chunk:
+        yield chunk
 
 
 # ─────────────────────────────────────────────────────────────────
-# Main entry point
+# Process a single chunk of SNPs (interval computation + MLE submit)
 # ─────────────────────────────────────────────────────────────────
 
-def main():
-    parser = argparse.ArgumentParser(
-        description='Compute Singleton Density Scores (SDS) — parallel Python version',
-        formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('s_file',  help='Singleton positions file')
-    parser.add_argument('t_file',  help='Test SNPs file')
-    parser.add_argument('o_file',  help='Singleton observability file')
-    parser.add_argument('b_file',  help='Chromosome boundaries file')
-    parser.add_argument('g_file',  help='Gamma shape parameters file')
-    parser.add_argument('init', type=float, help='Initial MLE guess (e.g. 1e-6)')
-    parser.add_argument('--max_singletons', type=int, default=10000,
-                        help='Max singletons per individual (default: 10000)')
-    parser.add_argument('--workers', '-w', type=int, default=None,
-                        help='Parallel workers for MLE (default: CPU count - 1)')
-    parser.add_argument('--debug', action='store_true',
-                        help='Print progress every 1000 SNPs')
-    args = parser.parse_args()
+def _process_snp_chunk(chunk, singletons_list, sin_obs, boundaries,
+                       boundaries_cur, gamma_freq, gamma_shape,
+                       logE_grid, logE_center, n_ind):
+    """
+    Compute intervals for a chunk of test-SNPs and build MLE task list.
 
-    n_workers = args.workers or max(1, cpu_count() - 1)
+    Returns (mle_tasks, task_info, boundaries_cur) where:
+      mle_tasks  — list of tuples ready for _run_mle_for_snp
+      task_info  — parallel list of per-SNP metadata dicts for output
 
-    # ── Load reference data ──
-    print(f"# Loading singletons from {args.s_file}...", file=sys.stderr)
-    singletons_list = read_singletons(args.s_file, args.max_singletons)
-    n_ind = len(singletons_list)
-    print(f"#   {n_ind} individuals, "
-          f"avg {np.mean([len(s) for s in singletons_list]):.0f} singletons/ind",
-          file=sys.stderr)
+    The caller is responsible for submitting mle_tasks to the executor
+    and pairing results with task_info.
+    """
+    mle_tasks = []
+    task_info = []
 
-    sin_obs = read_observability(args.o_file)
-    if sin_obs is None:
-        sin_obs = np.ones(n_ind, dtype=np.float64)
-    assert len(sin_obs) == n_ind, \
-        f"Observability has {len(sin_obs)} values but {n_ind} individuals in singletons"
-
-    boundaries = read_boundaries(args.b_file)
-    gamma_freq, gamma_shape = read_gamma_shape(args.g_file)
-
-    print(f"# Loaded: {n_ind} individuals, "
-          f"{len(boundaries)} boundary regions, "
-          f"{len(gamma_freq)} gamma points", file=sys.stderr)
-    print(f"# Using {n_workers} workers for parallel MLE optimization.", file=sys.stderr)
-
-    # ── Load all test SNPs ──
-    print(f"# Loading test SNPs from {args.t_file}...", file=sys.stderr)
-    test_snps = read_test_snps(args.t_file)
-    print(f"#   {len(test_snps)} test SNPs loaded", file=sys.stderr)
-
-    # ── Header ──
-    print("ID\tAA\tDA\tPOS\tDAF\tnG0\tnG1\tnG2\trSDS\tSuggestedInitPoint")
-
-    # ── Precompute log-E grid ──
-    e_grid_center = args.init
-    logE_grid = np.linspace(
-        np.log(e_grid_center) - np.log(E_GRID_SCALE_FACTOR),
-        np.log(e_grid_center) + np.log(E_GRID_SCALE_FACTOR),
-        E_GRID_NUM_POINTS
-    )
-    logE_center = np.log(e_grid_center)
-
-    # ── Phase 1: Precompute intervals for all valid SNPs ──
-    print(f"# Phase 1: Computing singleton intervals...", file=sys.stderr)
-
-    snp_tasks = []  # (index, dat0, dat1, dat2, A1, A2, snp_info)
-    boundaries_cur = 0
-    processed = 0
-
-    for snp_idx, snp in enumerate(test_snps):
+    for snp in chunk:
         test_loc = snp['location']
         raw_genotypes = snp['genotypes']
 
-        # Handle missing genotypes
-        valid_mask = ~np.isnan(raw_genotypes)
+        # Filter to individuals with valid genotypes
+        valid_mask = raw_genotypes != GENOTYPE_MISSING
         if not np.any(valid_mask):
             continue
 
@@ -455,22 +427,24 @@ def main():
         bound_up = boundaries[boundaries_cur, 0]
         bound_down = boundaries[boundaries_cur, 1]
 
-        # Compute intervals using binary search (only for valid individuals)
-        valid_singletons = [singletons_list[i] for i in range(n_ind) if valid_mask[i]]
+        # Filter singletons to valid individuals for this SNP
+        valid_singletons = [singletons_list[i] for i in range(n_ind)
+                            if valid_mask[i]]
+
         intervals = _compute_snp_intervals(
             test_loc, bound_up, bound_down,
-            valid_singletons, obs_valid, genotypes)
+            valid_singletons, obs_valid)
 
         if intervals is None:
             continue
 
-        # Split by genotype
+        # Split by genotype (genotypes are int8 0/1/2 for valid individuals)
         daf = float(np.mean(genotypes)) / 2.0
         dat0 = intervals[genotypes == 0]
         dat1 = intervals[genotypes == 1]
         dat2 = intervals[genotypes == 2]
 
-        # Skip if any genotype group is empty (degenerate)
+        # Skip if both homozygous groups are empty (degenerate)
         if len(dat0) == 0 and len(dat2) == 0:
             continue
 
@@ -478,7 +452,7 @@ def main():
         A1 = _get_gamma_shape(1.0 - daf, gamma_freq, gamma_shape)
         A2 = _get_gamma_shape(daf, gamma_freq, gamma_shape)
 
-        snp_info = {
+        task_info.append({
             'id': snp['id'],
             'allele1': snp['allele1'],
             'allele2': snp['allele2'],
@@ -487,66 +461,146 @@ def main():
             'n0': len(dat0),
             'n1': len(dat1),
             'n2': len(dat2),
-        }
+        })
 
-        snp_tasks.append((dat0, dat1, dat2, A1, A2, logE_grid, logE_center,
-                           n_workers, snp_info))
-        processed += 1
+        mle_tasks.append((dat0, dat1, dat2, A1, A2, logE_grid, logE_center))
 
-        if args.debug and processed % 1000 == 0:
-            print(f"#   Precomputed intervals for {processed} SNPs...",
-                   file=sys.stderr)
+    return mle_tasks, task_info, boundaries_cur
 
-    print(f"#   {len(snp_tasks)} SNPs with valid intervals", file=sys.stderr)
 
-    # ── Phase 2: Parallel MLE optimization ──
-    print(f"# Phase 2: Running parallel MLE optimization...", file=sys.stderr)
+# ─────────────────────────────────────────────────────────────────
+# Main entry point
+# ─────────────────────────────────────────────────────────────────
 
-    # Prepare tasks for worker processes (exclude n_workers from serialization)
-    mle_tasks = []
-    task_info = []
-    for task in snp_tasks:
-        dat0, dat1, dat2, A1, A2, grid, center, nw, info = task
-        mle_tasks.append((dat0, dat1, dat2, A1, A2, grid, center, 1))
-        task_info.append(info)
+def main():
+    parser = argparse.ArgumentParser(
+        description='Compute Singleton Density Scores (SDS) — parallel Python version',
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('s_file',  help='Singleton positions file')
+    parser.add_argument('t_file',  help='Test SNPs file')
+    parser.add_argument('o_file',  help='Singleton observability file')
+    parser.add_argument('b_file',  help='Chromosome boundaries file')
+    parser.add_argument('g_file',  help='Gamma shape parameters file')
+    parser.add_argument('init', type=float, help='Initial MLE guess (e.g. 1e-6)')
+    parser.add_argument('--max-singletons', type=int, default=10000,
+                        help='Max singletons per individual (default: 10000)')
+    parser.add_argument('--workers', '-w', type=int, default=None,
+                        help='Parallel workers for MLE (default: CPU count - 1)')
+    parser.add_argument('--chunk-size', '-c', type=int, default=2000,
+                        help='SNPs per processing chunk (default: 2000). '
+                             'Lower = less memory; higher = better parallelism.')
+    parser.add_argument('--debug', action='store_true',
+                        help='Print progress every 1000 SNPs')
+    args = parser.parse_args()
 
-    results = [None] * len(mle_tasks)
-    completed = 0
+    n_workers = args.workers or max(1, cpu_count() - 1)
+
+    # ── Load reference data (small, constant memory) ──
+    print(f"# Loading singletons from {args.s_file}...", file=sys.stderr)
+    singletons_list = read_singletons(args.s_file, args.max_singletons)
+    n_ind = len(singletons_list)
+    print(f"#   {n_ind} individuals, "
+          f"avg {np.mean([len(s) for s in singletons_list]):.0f} singletons/ind",
+          file=sys.stderr)
+
+    sin_obs = read_observability(args.o_file)
+    if sin_obs is None:
+        sin_obs = np.ones(n_ind, dtype=np.float64)
+    assert len(sin_obs) == n_ind, \
+        f"Observability has {len(sin_obs)} values but {n_ind} individuals in singletons"
+
+    boundaries = read_boundaries(args.b_file)
+    gamma_freq, gamma_shape = read_gamma_shape(args.g_file)
+
+    print(f"# Loaded: {n_ind} individuals, "
+          f"{len(boundaries)} boundary regions, "
+          f"{len(gamma_freq)} gamma points", file=sys.stderr)
+    print(f"# Chunk size: {args.chunk_size} SNPs, "
+          f"{n_workers} parallel workers", file=sys.stderr)
+
+    # ── Precompute log-E grid (same for all SNPs) ──
+    e_grid_center = args.init
+    logE_grid = np.linspace(
+        np.log(e_grid_center) - np.log(E_GRID_SCALE_FACTOR),
+        np.log(e_grid_center) + np.log(E_GRID_SCALE_FACTOR),
+        E_GRID_NUM_POINTS
+    )
+    logE_center = np.log(e_grid_center)
+
+    # ── Header ──
+    print("ID\tAA\tDA\tPOS\tDAF\tnG0\tnG1\tnG2\trSDS\tSuggestedInitPoint")
+
+    # ── Process SNPs in chunks ──
+    boundaries_cur = 0
+    total_processed = 0
+    total_valid = 0
 
     with ProcessPoolExecutor(max_workers=n_workers) as executor:
-        future_to_idx = {
-            executor.submit(_run_mle_for_snp, task): i
-            for i, task in enumerate(mle_tasks)
-        }
+        for chunk_idx, chunk in enumerate(
+                iter_test_snp_chunks(args.t_file, args.chunk_size)):
 
-        for future in as_completed(future_to_idx):
-            idx = future_to_idx[future]
-            results[idx] = future.result()
-            completed += 1
-            if args.debug and completed % 1000 == 0:
-                print(f"#   MLE completed for {completed}/{len(mle_tasks)} SNPs...",
-                       file=sys.stderr)
+            if args.debug:
+                print(f"# Chunk {chunk_idx + 1}: {len(chunk)} SNPs, "
+                      f"computing intervals...", file=sys.stderr)
 
-    # ── Output results in original order ──
-    for idx, info in enumerate(task_info):
-        best_params = results[idx]
-        if best_params is None:
-            continue
+            mle_tasks, task_info, boundaries_cur = _process_snp_chunk(
+                chunk, singletons_list, sin_obs, boundaries,
+                boundaries_cur, gamma_freq, gamma_shape,
+                logE_grid, logE_center, n_ind)
 
-        logE1, logE2 = best_params
-        rSDS = logE1 - logE2
-        suggested_exp = round(np.mean(best_params) / np.log(10.0))
-        suggested = f"1e{int(suggested_exp)}"
-        pos_str = (f"{info['location']:.0f}" if info['location'] < 1e6
-                   else f"{info['location']:.4g}")
+            if not mle_tasks:
+                total_processed += len(chunk)
+                continue
 
-        print(f"{info['id']}\t{info['allele1']}\t{info['allele2']}\t{pos_str}\t"
-              f"{info['daf']:.{PRECISION}f}\t"
-              f"{info['n0']}\t{info['n1']}\t{info['n2']}\t"
-              f"{rSDS:.{PRECISION}f}\t{suggested}")
+            if args.debug:
+                print(f"#   {len(mle_tasks)} valid SNPs, "
+                      f"submitting MLE jobs...", file=sys.stderr)
 
-    print(f"# Done. Processed {len(task_info)}/{len(test_snps)} SNPs.",
-           file=sys.stderr)
+            # Submit all MLE tasks for this chunk
+            future_to_idx = {
+                executor.submit(_run_mle_for_snp, task): i
+                for i, task in enumerate(mle_tasks)
+            }
+
+            results = [None] * len(mle_tasks)
+            chunk_completed = 0
+
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                results[idx] = future.result()
+                chunk_completed += 1
+                if args.debug and chunk_completed % 1000 == 0:
+                    print(f"#   MLE {chunk_completed}/{len(mle_tasks)}",
+                          file=sys.stderr)
+
+            # Output results for this chunk (preserves input order)
+            for idx, info in enumerate(task_info):
+                best_params = results[idx]
+                if best_params is None:
+                    continue
+
+                logE1, logE2 = best_params
+                rSDS = logE1 - logE2
+                suggested_exp = round(np.mean(best_params) / np.log(10.0))
+                suggested = f"1e{int(suggested_exp)}"
+                pos_str = (f"{info['location']:.0f}" if info['location'] < 1e6
+                           else f"{info['location']:.4g}")
+
+                print(f"{info['id']}\t{info['allele1']}\t{info['allele2']}\t"
+                      f"{pos_str}\t"
+                      f"{info['daf']:.{PRECISION}f}\t"
+                      f"{info['n0']}\t{info['n1']}\t{info['n2']}\t"
+                      f"{rSDS:.{PRECISION}f}\t{suggested}")
+
+            total_processed += len(chunk)
+            total_valid += len(task_info)
+
+            if args.debug:
+                print(f"#   Chunk done. Total: {total_valid} valid / "
+                      f"{total_processed} processed SNPs", file=sys.stderr)
+
+    print(f"# Done. {total_valid} / {total_processed} SNPs processed.",
+          file=sys.stderr)
 
 
 if __name__ == '__main__':
