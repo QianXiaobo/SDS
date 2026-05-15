@@ -500,7 +500,7 @@ def main():
 
     # ── Open output file ──
     if args.output and args.output != '-':
-        out_fh = open(args.output, 'w')
+        out_fh = open(args.output, 'w', buffering=1)  # line-buffered
     else:
         out_fh = sys.stdout
 
@@ -592,8 +592,7 @@ def main():
                     rSDS = logE1 - logE2
                     suggested_exp = round(np.mean(best_params) / np.log(10.0))
                     suggested = f"1e{int(suggested_exp)}"
-                    pos_str = (f"{info['location']:.0f}" if info['location'] < 1e6
-                               else f"{info['location']:.4g}")
+                    pos_str = str(int(info['location']))
 
                     print(f"{info['id']}\t{info['allele1']}\t{info['allele2']}\t"
                           f"{pos_str}\t"
