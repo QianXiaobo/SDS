@@ -19,6 +19,19 @@ Key optimizations over the R original:
      keeping memory bounded. This is critical for genome-scale data
      (e.g. 3M SNPs × 12K individuals comfortably fits in 16 GB RAM).
   5. Genotypes stored as int8 (8× memory reduction vs float64).
+  6. Vectorized chunk processing (v2): instead of per-SNP per-individual Python
+     loops, interval computation is batched — for each individual, all k SNP
+     positions in a chunk are processed simultaneously via vectorized
+     np.searchsorted. This eliminates O(n_snps × n_ind) Python-call overhead.
+  7. Diagnostic summary: comprehensive skip-reason counters and output
+     completeness checks are printed to stderr at completion, making it easy
+     to verify output integrity.
+
+Memory note (v2):
+  The vectorized approach stores (n_ind × chunk_size) intermediate arrays
+  (~192 MB per component for 12K ind × 2K SNPs). With the default chunk_size
+  of 2000, peak memory is ~500 MB for the chunk arrays + singleton data.
+  Reduce --chunk-size if memory is constrained.
 
 Dependencies:
     pip install numpy scipy
@@ -199,73 +212,169 @@ def _run_mle_for_snp(snp_task):
 
 
 # ─────────────────────────────────────────────────────────────────
-# Singleton distance computation using searchsorted (O(log n))
+# Vectorized chunk processing — batched per-individual searchsorted
 # ─────────────────────────────────────────────────────────────────
 
-def _compute_snp_intervals(test_loc, bound_up, bound_down,
-                           singletons_list, sin_observability):
+def _process_chunk_vectorized(chunk, singletons_list, sin_obs, boundaries,
+                               boundaries_cur, gamma_freq, gamma_shape,
+                               logE_grid, logE_center, n_ind):
     """
-    Compute singleton intervals for one test-SNP using binary search.
+    Process a chunk of SNPs with fully vectorized interval computation.
 
-    Each individual's singletons are stored as a sorted array, so we can
-    use np.searchsorted to find the nearest upstream/downstream singleton
-    in O(log n) time instead of the R code's O(n) linear scan.
+    Instead of per-SNP per-individual Python loops (O(k * n_ind) overhead),
+    this loops over individuals once and uses batched np.searchsorted on all
+    k SNP positions simultaneously. The inner operations are all numpy-level.
 
-    Parameters
-    ----------
-    test_loc : float
-        Test-SNP position.
-    bound_up, bound_down : float
-        Boundary limits.
-    singletons_list : list of ndarray
-        One sorted array per individual.
-    sin_observability : ndarray
-        Observability correction per individual.
-
-    Returns
-    -------
-    ndarray or None
-        Singleton intervals array, or None if SNP should be skipped.
+    Returns (mle_tasks, task_info, boundaries_cur, skip_stats) where
+    skip_stats is a dict of {reason: count}.
     """
-    n_ind = len(singletons_list)
-    upstream = np.full(n_ind, np.nan)
-    downstream = np.full(n_ind, np.nan)
+    k = len(chunk)
 
-    for i in range(n_ind):
-        s = singletons_list[i]
-        if len(s) == 0:
+    # ── Extract positions, genotype masks, and metadata ──
+    positions = np.empty(k)
+    valid_masks = [None] * k
+    genotypes_list = [None] * k
+    snp_meta = [None] * k
+
+    for j, snp in enumerate(chunk):
+        positions[j] = snp['location']
+        raw_geno = snp['genotypes']
+        if len(raw_geno) != n_ind:
+            # Genotype count mismatch — treat all as missing (SNP will be filtered)
+            valid_masks[j] = np.zeros(n_ind, dtype=bool)
+            genotypes_list[j] = np.array([], dtype=np.int8)
+        else:
+            mask = raw_geno != GENOTYPE_MISSING
+            valid_masks[j] = mask
+            genotypes_list[j] = raw_geno[mask]
+        snp_meta[j] = (snp['id'], snp['allele1'], snp['allele2'])
+
+    # ── Assign boundaries per SNP ──
+    bound_ups = np.full(k, np.nan)
+    bound_downs = np.full(k, np.nan)
+    snp_in_boundary = np.zeros(k, dtype=bool)
+
+    n_past_all = 0
+    n_between = 0
+
+    for j in range(k):
+        test_loc = positions[j]
+        while boundaries_cur < len(boundaries) and boundaries[boundaries_cur, 1] < test_loc:
+            boundaries_cur += 1
+        if boundaries_cur >= len(boundaries):
+            n_past_all = k - j  # remaining SNPs past last boundary
+            break
+        if boundaries[boundaries_cur, 0] > test_loc:
+            n_between += 1
+            continue
+        snp_in_boundary[j] = True
+        bound_ups[j] = boundaries[boundaries_cur, 0]
+        bound_downs[j] = boundaries[boundaries_cur, 1]
+
+    # ── Vectorized interval computation per individual ──
+    upstream = np.full((n_ind, k), np.nan)
+    downstream = np.full((n_ind, k), np.nan)
+
+    active = np.where(snp_in_boundary)[0]
+    if len(active) > 0:
+        pos_active = positions[active]
+        bu_active = bound_ups[active]
+        bd_active = bound_downs[active]
+
+        for i, s in enumerate(singletons_list):
+            if len(s) == 0:
+                continue
+
+            idx = np.searchsorted(s, pos_active)  # (k_active,)
+
+            # Upstream: singleton just before each test position
+            up_ok = idx > 0
+            up_idx = np.where(up_ok)[0]
+            if len(up_idx) > 0:
+                s_before = s[idx[up_idx] - 1]
+                within = s_before >= bu_active[up_idx]
+                good = up_idx[within]
+                if len(good) > 0:
+                    j_global = active[good]
+                    upstream[i, j_global] = positions[j_global] - s[idx[good] - 1]
+
+            # Downstream: singleton at or after each test position
+            down_ok = idx < len(s)
+            down_idx = np.where(down_ok)[0]
+            if len(down_idx) > 0:
+                s_after = s[idx[down_idx]]
+                within = s_after <= bd_active[down_idx]
+                good = down_idx[within]
+                if len(good) > 0:
+                    j_global = active[good]
+                    downstream[i, j_global] = s[idx[good]] - positions[j_global]
+
+    # ── Per-SNP: NA check, genotype split, build MLE tasks ──
+    mle_tasks = []
+    task_info = []
+    n_na_skip = 0
+    n_degenerate = 0
+
+    for j in range(k):
+        if not snp_in_boundary[j]:
             continue
 
-        # Find insertion point for test_loc in sorted singletons
-        idx = np.searchsorted(s, test_loc)
+        mask = valid_masks[j]
+        n_valid = np.count_nonzero(mask)
+        if n_valid == 0:
+            continue
 
-        # Upstream: nearest singleton before test_loc
-        if idx > 0:
-            s_loc = s[idx - 1]
-            if s_loc >= bound_up:
-                upstream[i] = test_loc - s_loc
+        up_col = upstream[mask, j]
+        down_col = downstream[mask, j]
 
-        # Downstream: nearest singleton at or after test_loc
-        if idx < len(s):
-            s_loc = s[idx]
-            if s_loc <= bound_down:
-                downstream[i] = s_loc - test_loc
+        na_up = np.mean(np.isnan(up_col))
+        na_down = np.mean(np.isnan(down_col))
 
-    # Check boundary missing fraction
-    na_up = np.mean(np.isnan(upstream))
-    na_down = np.mean(np.isnan(downstream))
+        if na_up > SKIP_BOUNDARY_FRACTION or na_down > SKIP_BOUNDARY_FRACTION:
+            n_na_skip += 1
+            continue
 
-    if na_up > SKIP_BOUNDARY_FRACTION or na_down > SKIP_BOUNDARY_FRACTION:
-        return None
+        # Fill remaining NAs with max observed in that component
+        if na_up > 0:
+            up_col[np.isnan(up_col)] = np.nanmax(up_col)
+        if na_down > 0:
+            down_col[np.isnan(down_col)] = np.nanmax(down_col)
 
-    # Fill NAs with max observed distance
-    if na_up > 0 and na_up <= SKIP_BOUNDARY_FRACTION:
-        upstream[np.isnan(upstream)] = np.nanmax(upstream)
-    if na_down > 0 and na_down <= SKIP_BOUNDARY_FRACTION:
-        downstream[np.isnan(downstream)] = np.nanmax(downstream)
+        intervals = (up_col + down_col) * sin_obs[mask]
 
-    intervals = (upstream + downstream) * sin_observability
-    return intervals
+        genotypes = genotypes_list[j]
+        dat0 = intervals[genotypes == 0]
+        dat1 = intervals[genotypes == 1]
+        dat2 = intervals[genotypes == 2]
+
+        if len(dat0) == 0 and len(dat2) == 0:
+            n_degenerate += 1
+            continue
+
+        daf = float(np.mean(genotypes)) / 2.0
+        A1 = _get_gamma_shape(1.0 - daf, gamma_freq, gamma_shape)
+        A2 = _get_gamma_shape(daf, gamma_freq, gamma_shape)
+
+        snp_id, a1, a2 = snp_meta[j]
+        task_info.append({
+            'id': snp_id,
+            'allele1': a1,
+            'allele2': a2,
+            'location': positions[j],
+            'daf': daf,
+            'n0': len(dat0),
+            'n1': len(dat1),
+            'n2': len(dat2),
+        })
+        mle_tasks.append((dat0, dat1, dat2, A1, A2, logE_grid, logE_center))
+
+    skip_stats = {
+        'past_all_boundaries': n_past_all,
+        'between_boundaries': n_between,
+        'na_fraction': n_na_skip,
+        'degenerate': n_degenerate,
+    }
+    return mle_tasks, task_info, boundaries_cur, skip_stats
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -295,13 +404,16 @@ def read_singletons(path, max_cols=10000):
 
     Returns list of ndarray, which is more memory-efficient than a padded
     NaN matrix and enables O(log n) lookup via np.searchsorted.
+
+    Each individual's singletons are truncated to the first max_cols entries
+    to bound worst-case memory usage.
     """
     singletons = []
     with open(path, 'r') as fh:
         for line in fh:
             tokens = line.strip().split()
             vals = []
-            for t in tokens:
+            for t in tokens[:max_cols]:
                 try:
                     v = float(t)
                     if not np.isnan(v):
@@ -382,93 +494,6 @@ def iter_test_snp_chunks(path, chunk_size):
 
 
 # ─────────────────────────────────────────────────────────────────
-# Process a single chunk of SNPs (interval computation + MLE submit)
-# ─────────────────────────────────────────────────────────────────
-
-def _process_snp_chunk(chunk, singletons_list, sin_obs, boundaries,
-                       boundaries_cur, gamma_freq, gamma_shape,
-                       logE_grid, logE_center, n_ind):
-    """
-    Compute intervals for a chunk of test-SNPs and build MLE task list.
-
-    Returns (mle_tasks, task_info, boundaries_cur) where:
-      mle_tasks  — list of tuples ready for _run_mle_for_snp
-      task_info  — parallel list of per-SNP metadata dicts for output
-
-    The caller is responsible for submitting mle_tasks to the executor
-    and pairing results with task_info.
-    """
-    mle_tasks = []
-    task_info = []
-
-    for snp in chunk:
-        test_loc = snp['location']
-        raw_genotypes = snp['genotypes']
-
-        # Filter to individuals with valid genotypes
-        valid_mask = raw_genotypes != GENOTYPE_MISSING
-        if not np.any(valid_mask):
-            continue
-
-        genotypes = raw_genotypes[valid_mask]
-        obs_valid = sin_obs[valid_mask]
-
-        # Advance boundary index
-        while (boundaries_cur < len(boundaries)
-               and boundaries[boundaries_cur, 1] < test_loc):
-            boundaries_cur += 1
-
-        if boundaries_cur >= len(boundaries):
-            break
-
-        if boundaries[boundaries_cur, 0] > test_loc:
-            continue
-
-        bound_up = boundaries[boundaries_cur, 0]
-        bound_down = boundaries[boundaries_cur, 1]
-
-        # Filter singletons to valid individuals for this SNP
-        valid_singletons = [singletons_list[i] for i in range(n_ind)
-                            if valid_mask[i]]
-
-        intervals = _compute_snp_intervals(
-            test_loc, bound_up, bound_down,
-            valid_singletons, obs_valid)
-
-        if intervals is None:
-            continue
-
-        # Split by genotype (genotypes are int8 0/1/2 for valid individuals)
-        daf = float(np.mean(genotypes)) / 2.0
-        dat0 = intervals[genotypes == 0]
-        dat1 = intervals[genotypes == 1]
-        dat2 = intervals[genotypes == 2]
-
-        # Skip if both homozygous groups are empty (degenerate)
-        if len(dat0) == 0 and len(dat2) == 0:
-            continue
-
-        # Gamma shape parameters
-        A1 = _get_gamma_shape(1.0 - daf, gamma_freq, gamma_shape)
-        A2 = _get_gamma_shape(daf, gamma_freq, gamma_shape)
-
-        task_info.append({
-            'id': snp['id'],
-            'allele1': snp['allele1'],
-            'allele2': snp['allele2'],
-            'location': test_loc,
-            'daf': daf,
-            'n0': len(dat0),
-            'n1': len(dat1),
-            'n2': len(dat2),
-        })
-
-        mle_tasks.append((dat0, dat1, dat2, A1, A2, logE_grid, logE_center))
-
-    return mle_tasks, task_info, boundaries_cur
-
-
-# ─────────────────────────────────────────────────────────────────
 # Main entry point
 # ─────────────────────────────────────────────────────────────────
 
@@ -541,30 +566,54 @@ def main():
 
     # ── Process SNPs in chunks ──
     boundaries_cur = 0
-    total_processed = 0
-    total_valid = 0
+    total_read = 0
+    total_output = 0
+
+    # Track skip reasons for final diagnostic summary
+    skip_counts = {
+        'past_all_boundaries': 0,
+        'between_boundaries': 0,
+        'na_fraction': 0,
+        'degenerate': 0,
+        'mle_failed': 0,
+    }
 
     try:
         with ProcessPoolExecutor(max_workers=n_workers) as executor:
             for chunk_idx, chunk in enumerate(
                     iter_test_snp_chunks(args.t_file, args.chunk_size)):
 
+                total_read += len(chunk)
+
                 if args.debug:
-                    print(f"# Chunk {chunk_idx + 1}: {len(chunk)} SNPs, "
-                          f"computing intervals...")
+                    print(f"# Chunk {chunk_idx + 1}: {len(chunk)} SNPs "
+                          f"(total read: {total_read}), computing intervals...")
 
-                mle_tasks, task_info, boundaries_cur = _process_snp_chunk(
-                    chunk, singletons_list, sin_obs, boundaries,
-                    boundaries_cur, gamma_freq, gamma_shape,
-                    logE_grid, logE_center, n_ind)
+                mle_tasks, task_info, boundaries_cur, skip_stats = \
+                    _process_chunk_vectorized(
+                        chunk, singletons_list, sin_obs, boundaries,
+                        boundaries_cur, gamma_freq, gamma_shape,
+                        logE_grid, logE_center, n_ind)
 
-                if not mle_tasks:
-                    total_processed += len(chunk)
-                    continue
+                for key in skip_counts:
+                    skip_counts[key] += skip_stats.get(key, 0)
 
                 if args.debug:
                     print(f"#   {len(mle_tasks)} valid SNPs, "
                           f"submitting MLE jobs...")
+                    if skip_stats['na_fraction'] > 0:
+                        print(f"#   Skipped (NA fraction):    {skip_stats['na_fraction']}")
+                    if skip_stats['degenerate'] > 0:
+                        print(f"#   Skipped (degenerate):     {skip_stats['degenerate']}")
+                    if skip_stats['between_boundaries'] > 0:
+                        print(f"#   Skipped (no boundary):    {skip_stats['between_boundaries']}")
+
+                if not mle_tasks:
+                    if skip_stats['past_all_boundaries'] > 0:
+                        if args.debug:
+                            print(f"#   Past last boundary — processing complete.")
+                        break
+                    continue
 
                 # Submit all MLE tasks for this chunk
                 future_to_idx = {
@@ -574,15 +623,25 @@ def main():
 
                 results = [None] * len(mle_tasks)
                 chunk_completed = 0
+                n_mle_failures = 0
 
                 for future in as_completed(future_to_idx):
                     idx = future_to_idx[future]
-                    results[idx] = future.result()
                     chunk_completed += 1
+                    try:
+                        results[idx] = future.result()
+                    except Exception as e:
+                        n_mle_failures += 1
+                        if args.debug:
+                            snp_id = task_info[idx]['id']
+                            print(f"#   WARNING: MLE failed for SNP {snp_id}: {e}")
                     if args.debug and chunk_completed % 1000 == 0:
                         print(f"#   MLE {chunk_completed}/{len(mle_tasks)}")
 
+                skip_counts['mle_failed'] += n_mle_failures
+
                 # Output results for this chunk (preserves input order)
+                n_written = 0
                 for idx, info in enumerate(task_info):
                     best_params = results[idx]
                     if best_params is None:
@@ -600,15 +659,43 @@ def main():
                           f"{info['n0']}\t{info['n1']}\t{info['n2']}\t"
                           f"{rSDS:.{PRECISION}f}\t{suggested}",
                           file=out_fh)
+                    n_written += 1
 
-                total_processed += len(chunk)
-                total_valid += len(task_info)
+                total_output += n_written
 
                 if args.debug:
-                    print(f"#   Chunk done. Total: {total_valid} valid / "
-                          f"{total_processed} processed SNPs")
+                    print(f"#   Chunk done: {n_written} output rows. "
+                          f"Running total: {total_output} rows.")
 
-        print(f"# Done. {total_valid} / {total_processed} SNPs processed.")
+        # ── Final diagnostic summary ──
+        print(file=sys.stderr)
+        print("=" * 56, file=sys.stderr)
+        print("  SDS COMPUTATION SUMMARY", file=sys.stderr)
+        print("=" * 56, file=sys.stderr)
+        print(f"  Total SNPs read:              {total_read:>10d}", file=sys.stderr)
+        print(f"  Past last boundary:           {skip_counts['past_all_boundaries']:>10d}", file=sys.stderr)
+        print(f"  No boundary region:           {skip_counts['between_boundaries']:>10d}", file=sys.stderr)
+        print(f"  High NA fraction (>5%):       {skip_counts['na_fraction']:>10d}", file=sys.stderr)
+        print(f"  Degenerate genotypes:         {skip_counts['degenerate']:>10d}", file=sys.stderr)
+        print(f"  MLE optimization failures:    {skip_counts['mle_failed']:>10d}", file=sys.stderr)
+        print(f"  {'-' * 40}", file=sys.stderr)
+        print(f"  Valid output rows written:    {total_output:>10d}", file=sys.stderr)
+        print("=" * 56, file=sys.stderr)
+
+        if total_output == 0:
+            print(file=sys.stderr)
+            print("*** WARNING: Zero output rows! Check your input data. ***",
+                  file=sys.stderr)
+            print("  - Are test SNP positions within the chromosome boundaries?",
+                  file=sys.stderr)
+            print("  - Does the singletons file have data for all individuals?",
+                  file=sys.stderr)
+        elif total_output < total_read * 0.1:
+            print(file=sys.stderr)
+            print(f"*** NOTE: Only {total_output}/{total_read} "
+                  f"({100.0 * total_output / total_read:.1f}%) SNPs produced output. "
+                  f"Check if this is expected. ***",
+                  file=sys.stderr)
     finally:
         if out_fh is not sys.stdout:
             out_fh.close()
